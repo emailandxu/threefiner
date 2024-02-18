@@ -113,7 +113,7 @@ class IF(nn.Module):
         pred_rgb,
         step_ratio=None,
         guidance_scale=50,
-        vers=None, hors=None,
+        vers=None, hors=None, **kwargs
     ):
         
         batch_size = pred_rgb.shape[0]

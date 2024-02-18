@@ -1,0 +1,413 @@
+from diffusers import (
+    PNDMScheduler,
+    DDIMScheduler,
+    StableDiffusionPipeline,
+)
+
+from threefiner.guidance.pipeline.mvdream import MVDreamPipeline
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from typing import List
+
+
+class MVDream(nn.Module):
+    def __init__(
+        self,
+        device,
+        fp16=True,
+        vram_O=False,
+        model_key="ashawkey/mvdream-sd2.1-diffusers",
+        # model_key="philz1337/revanimated",
+        t_range=[0.02, 0.50],
+    ):
+        super().__init__()
+
+        self.device = device
+        self.model_key = model_key
+        self.dtype = torch.float16 if fp16 else torch.float32
+
+        # Create model
+        self.pipe = MVDreamPipeline.from_pretrained(
+            model_key, torch_dtype=self.dtype, trust_remote_code=True
+        )
+
+        if vram_O:
+            self.pipe.enable_sequential_cpu_offload()
+            self.pipe.enable_vae_slicing()
+            self.pipe.unet.to(memory_format=torch.channels_last)
+            self.pipe.enable_attention_slicing(1)
+            # self.pipe.enable_model_cpu_offload()
+        else:
+            self.pipe.to(device)
+
+        self.vae = self.pipe.vae
+        self.tokenizer = self.pipe.tokenizer
+        self.text_encoder = self.pipe.text_encoder
+        self.unet = self.pipe.unet
+
+        self.scheduler = DDIMScheduler.from_pretrained(
+            model_key, subfolder="scheduler", torch_dtype=self.dtype
+        )
+
+        self.num_train_timesteps = self.scheduler.config.num_train_timesteps
+        self.min_step = int(self.num_train_timesteps * t_range[0])
+        self.max_step = int(self.num_train_timesteps * t_range[1])
+        self.alphas = self.scheduler.alphas_cumprod.to(self.device)  # for convenience
+
+        self.embeddings = {}
+
+    @torch.no_grad()
+    def get_text_embeds(self, prompts: List[str], negative_prompts: List[str]):
+        # pos_embeds = self.encode_text(prompts)  # [1, 77, 768]
+        # neg_embeds = self.encode_text(negative_prompts)
+        # self.embeddings['pos'] = pos_embeds
+        # self.embeddings['neg'] = neg_embeds
+
+        _prompt_embeds = self.pipe._encode_prompt(
+            prompt=prompts,
+            device=self.device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=True,
+            negative_prompt=negative_prompts,
+        )  # type: ignore
+        prompt_embeds_neg, prompt_embeds_pos = _prompt_embeds.chunk(2)
+        self.embeddings["pos"] = prompt_embeds_pos
+        self.embeddings["neg"] = prompt_embeds_neg
+
+        # directional embeddings f'{p}, {d} view'
+        for d in ["front", "side", "back"]:
+            view_prompts = [f"{p}, {d} view" for p in prompts]
+            embeds = self.pipe._encode_prompt(
+                prompt=view_prompts,
+                device=self.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=True,
+                negative_prompt=negative_prompts,
+            )[[1]]
+            self.embeddings[d] = embeds
+
+    @torch.no_grad()
+    def refine(
+        self,
+        pred_rgb,
+        guidance_scale=100,
+        steps=50,
+        strength=0.8,
+    ):
+
+        batch_size = pred_rgb.shape[0]
+        pred_rgb_256 = F.interpolate(
+            pred_rgb, (256, 256), mode="bilinear", align_corners=False
+        )
+        latents = self.encode_imgs(pred_rgb_256.to(self.dtype))
+        # latents = torch.randn((1, 4, 64, 64), device=self.device, dtype=self.dtype)
+
+        self.scheduler.set_timesteps(steps)
+        init_step = int(steps * strength)
+        latents = self.scheduler.add_noise(
+            latents, torch.randn_like(latents), self.scheduler.timesteps[init_step]
+        )
+        embeddings = torch.cat(
+            [
+                self.embeddings["pos"].expand(batch_size, -1, -1),
+                self.embeddings["neg"].expand(batch_size, -1, -1),
+            ]
+        )
+
+        for i, t in enumerate(self.scheduler.timesteps[init_step:]):
+
+            latent_model_input = torch.cat([latents] * 2)
+
+            noise_pred = self.unet(
+                latent_model_input,
+                t,
+                encoder_hidden_states=embeddings,
+            ).sample
+
+            noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (
+                noise_pred_cond - noise_pred_uncond
+            )
+
+            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+
+        imgs = self.decode_latents(latents)  # [1, 3, 512, 512]
+        return imgs
+
+    def train_step(
+        self,
+        pred_rgb,
+        step_ratio=None,
+        guidance_scale=100,
+        as_latent=False,
+        vers=None,
+        hors=None,
+        radii=None,
+        n_view=4,
+        **kwargs,
+    ):
+        batch_size = pred_rgb.shape[0]
+        pred_rgb = pred_rgb.to(self.dtype)
+
+        if as_latent:
+            latents = (
+                F.interpolate(pred_rgb, (64, 64), mode="bilinear", align_corners=False)
+                * 2
+                - 1
+            )
+        else:
+            # interp to 512x512 to be fed into vae.
+            pred_rgb_256 = F.interpolate(
+                pred_rgb, (256, 256), mode="bilinear", align_corners=False
+            )
+            # encode image into latents with vae, requires grad!
+            latents = self.encode_imgs(pred_rgb_256)
+
+        with torch.no_grad():
+
+            if step_ratio is not None:
+                # dreamtime-like
+                # t = self.max_step - (self.max_step - self.min_step) * np.sqrt(step_ratio)
+                t = np.round((1 - step_ratio) * self.num_train_timesteps).clip(
+                    self.min_step, self.max_step
+                )
+                t = torch.full((batch_size,), t, dtype=torch.long, device=self.device)
+            else:
+                t = torch.randint(
+                    self.min_step,
+                    self.max_step + 1,
+                    (batch_size,),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+
+            # w(t), sigma_t^2
+            w = (1 - self.alphas[t]).view(batch_size, 1, 1, 1)
+
+            ######### debug
+            # # Text embeds -> img latents
+            # latentsx = self.produce_latents(
+            #     height=512,
+            #     width=512,
+            #     latents=torch.randn_like(latents),
+            #     num_inference_steps=50,
+            #     guidance_scale=7.5,
+            # )  # [1, 4, 64, 64]
+
+            # # Img latents -> imgs
+            # imgs = self.decode_latents(latentsx)  # [1, 3, 512, 512]
+            # import kiui
+            # kiui.vis.plot_image(imgs)
+            #########
+
+            # add noise
+            noise = torch.randn_like(latents)
+            latents_noisy = self.scheduler.add_noise(latents, noise, t)
+            # pred noise
+            latent_model_input = torch.cat([latents_noisy] * 2)
+            tt = torch.cat([t] * 2)
+
+            if hors is None:
+                embeddings = torch.cat(
+                    [
+                        self.embeddings["pos"].expand(batch_size, -1, -1),
+                        self.embeddings["neg"].expand(batch_size, -1, -1),
+                    ]
+                )
+            else:
+
+                def _get_dir_ind(h):
+                    if abs(h) < 60:
+                        return "front"
+                    elif abs(h) < 120:
+                        return "side"
+                    else:
+                        return "back"
+
+                embeddings = torch.cat(
+                    [self.embeddings[_get_dir_ind(h)] for h in hors]
+                    + [self.embeddings["neg"].expand(batch_size, -1, -1)]
+                )
+
+            unet_inputs = {
+                "x": latent_model_input,
+                "timesteps": tt,
+                "context": embeddings,
+                "num_frames": n_view,
+                # 'camera': torch.cat([camera] * 2),
+            }
+
+            # noise_pred = self.unet(
+            #     latent_model_input, tt, encoder_hidden_states=embeddings
+            # ).sample
+            noise_pred = self.unet(**unet_inputs)
+
+            # perform guidance (high scale from paper!)
+            noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (
+                noise_pred_cond - noise_pred_uncond
+            )
+
+            grad = w * (noise_pred - noise)
+            grad = torch.nan_to_num(grad)
+
+            # grad_norm = torch.norm(grad, dim=-1, keepdim=True) + 1e-8
+            # grad = grad_norm.clamp(max=0.1) * grad / grad_norm
+
+            target = (latents - grad).detach()
+
+        loss = (
+            0.5
+            * F.mse_loss(latents.float(), target, reduction="sum")
+            / latents.shape[0]
+        )
+        # from matplotlib import pyplot as plt
+        # from torchvision.utils import make_grid 
+        # plt.imshow(
+        #     (
+        #         make_grid(self.decode_latents(noise_pred - noise).detach().cpu(), 1, 4)
+        #         .permute(1, 2, 0)
+        #         .cpu()[..., :3]
+        #         * 255
+        #     ).int()
+        # )
+        return loss
+
+    @torch.no_grad()
+    def produce_latents(
+        self,
+        height=512,
+        width=512,
+        num_inference_steps=50,
+        guidance_scale=7.5,
+        latents=None,
+    ):
+        if latents is None:
+            latents = torch.randn(
+                (
+                    1,
+                    self.unet.in_channels,
+                    height // 8,
+                    width // 8,
+                ),
+                device=self.device,
+            )
+
+        batch_size = latents.shape[0]
+
+        self.scheduler.set_timesteps(num_inference_steps)
+        embeddings = torch.cat(
+            [
+                self.embeddings["pos"].expand(batch_size, -1, -1),
+                self.embeddings["neg"].expand(batch_size, -1, -1),
+            ]
+        )
+
+        for i, t in enumerate(self.scheduler.timesteps):
+            # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+            latent_model_input = torch.cat([latents] * 2)
+            # predict the noise residual
+            noise_pred = self.unet(
+                latent_model_input, t, encoder_hidden_states=embeddings
+            ).sample
+
+            # perform guidance
+            noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (
+                noise_pred_cond - noise_pred_uncond
+            )
+
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+
+        return latents
+
+    def decode_latents(self, latents):
+        latents = 1 / self.vae.config.scaling_factor * latents
+
+        imgs = self.vae.decode(latents).sample
+        imgs = (imgs / 2 + 0.5).clamp(0, 1)
+
+        return imgs
+
+    def encode_imgs(self, imgs):
+        # imgs: [B, 3, H, W]
+
+        imgs = 2 * imgs - 1
+
+        posterior = self.vae.encode(imgs).latent_dist
+        latents = posterior.sample() * self.vae.config.scaling_factor
+
+        return latents
+
+    def prompt_to_img(
+        self,
+        prompts,
+        negative_prompts="",
+        height=512,
+        width=512,
+        num_inference_steps=50,
+        guidance_scale=7.5,
+        latents=None,
+    ):
+        if isinstance(prompts, str):
+            prompts = [prompts]
+
+        if isinstance(negative_prompts, str):
+            negative_prompts = [negative_prompts]
+
+        # Prompts -> text embeds
+        self.get_text_embeds(prompts, negative_prompts)
+
+        # Text embeds -> img latents
+        latents = self.produce_latents(
+            height=height,
+            width=width,
+            latents=latents,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+        )  # [1, 4, 64, 64]
+
+        # Img latents -> imgs
+        imgs = self.decode_latents(latents)  # [1, 3, 512, 512]
+
+        # Img to Numpy
+        imgs = imgs.detach().cpu().permute(0, 2, 3, 1).numpy()
+        imgs = (imgs * 255).round().astype("uint8")
+
+        return imgs
+
+
+if __name__ == "__main__":
+    import kiui
+    import argparse
+    import matplotlib.pyplot as plt
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("prompt", type=str)
+    parser.add_argument("--negative", default="", type=str)
+    parser.add_argument("--fp16", action="store_true", help="use float16 for training")
+    parser.add_argument(
+        "--vram_O", action="store_true", help="optimization for low VRAM usage"
+    )
+    parser.add_argument("-H", type=int, default=512)
+    parser.add_argument("-W", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--steps", type=int, default=50)
+    opt = parser.parse_args()
+
+    kiui.seed_everything(opt.seed)
+
+    device = torch.device("cuda")
+
+    sd = MVDream(device, opt.fp16, opt.vram_O)
+
+    imgs = sd.prompt_to_img(opt.prompt, opt.negative, opt.H, opt.W, opt.steps)
+
+    # visualize image
+    plt.imshow(imgs[0])
+    plt.show()

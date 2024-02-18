@@ -20,7 +20,7 @@ class Options:
     # training iterations
     iters: int = 500
     # training resolution
-    render_resolution: int = 512
+    render_resolution: int = 64
     # training camera radius
     radius: float = 2.5
     # training camera fovy in degree
@@ -40,14 +40,20 @@ class Options:
     save: Optional[str] = None
 
     # guidance mode
-    mode: Literal['SD', 'IF', 'IF2', 'SDCN', 'SD_NFSD', 'IF2_NFSD', 'SD_ISM', 'IF2_ISM'] = 'IF2'
+    mode: Literal['SD', 'IF', 'IF2', 'SDCN', 'SD_NFSD', 'IF2_NFSD', 'SD_ISM', 'IF2_ISM', "MVDream"] = 'IF2'
     # renderer geometry mode
     geom_mode: Literal['mesh', 'diffmc', 'pbr_mesh', 'pbr_diffmc'] = 'diffmc'
     # renderer texture mode
     tex_mode: Literal['hashgrid', 'mlp', 'triplane'] = 'hashgrid'
     
+    mv_mode: bool = False
+
     # training batch size per iter
-    batch_size: int = 1
+    
+    
+    batch_size: int = 4
+    n_view: int = 4
+
     # environmental texture
     env_texture: Optional[str] = None
     # environmental light scale
@@ -62,7 +68,7 @@ class Options:
     # remesh target edge length (smaller value lead to finer mesh)
     remesh_size: float = 0.015
     # texture resolution
-    texture_resolution: int = 1024
+    texture_resolution: int = 512
     # learning rate for hashgrid
     hashgrid_lr: float = 0.01
     # learning rate for feature MLP
@@ -100,6 +106,12 @@ config_doc: Dict[str, str] = {}
 config_doc['sd'] = 'coarse-level generation with stable-diffusion 2.'
 config_defaults['sd'] = Options(
     mode='SD',
+    iters=800,
+)
+
+config_doc['mvdream'] = 'coarse-level generation with mvdream.'
+config_defaults['mvdream'] = Options(
+    mode='MVDream',
     iters=800,
 )
 

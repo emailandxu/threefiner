@@ -105,7 +105,7 @@ class IF2(nn.Module):
         step_ratio=None,
         guidance_scale=5,
         vers=None, hors=None,
-        delta_t=50, delta_s=200,
+        delta_t=50, delta_s=200, **kwargs
     ):
         
         batch_size = pred_rgb.shape[0]

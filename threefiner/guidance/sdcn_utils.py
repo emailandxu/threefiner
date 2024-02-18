@@ -176,7 +176,7 @@ class StableDiffusionControlNet(nn.Module):
         guidance_scale=100,
         as_latent=False,
         control_images=None,
-        vers=None, hors=None,
+        vers=None, hors=None, **kwargs
     ):
         
         batch_size = pred_rgb.shape[0]

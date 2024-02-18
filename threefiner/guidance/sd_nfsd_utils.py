@@ -119,7 +119,7 @@ class StableDiffusion(nn.Module):
         step_ratio=None,
         guidance_scale=7.5,
         as_latent=False,
-        vers=None, hors=None,
+        vers=None, hors=None, **kwargs
     ):
         
         batch_size = pred_rgb.shape[0]

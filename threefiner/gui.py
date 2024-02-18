@@ -20,6 +20,11 @@ from threefiner.opt import Options
 
 class GUI:
     def __init__(self, opt: Options):
+        from .datasets.mvdataset import MVDataset
+        self.dataset = MVDataset(opt)
+
+
+
         self.opt = opt  # shared with the trainer's opt to support in-place modification of rendering parameters.
         if not GUI_AVAILABLE and opt.gui:
             print(f'[WARN] cannot import dearpygui, assume without --gui')
@@ -102,6 +107,7 @@ class GUI:
 
         # lazy load guidance model
         if self.guidance is None:
+            # breakpoint()
             print(f"[INFO] loading guidance...")
             if self.opt.mode == 'SD':
                 from threefiner.guidance.sd_utils import StableDiffusion
@@ -127,6 +133,10 @@ class GUI:
             elif self.opt.mode == 'IF2_ISM':
                 from threefiner.guidance.if2_ism_utils import IF2
                 self.guidance = IF2(self.device)
+            elif self.opt.mode == "MVDream":
+                from threefiner.guidance.mvd_utils import MVDream
+                self.guidance = MVDream(self.device)
+
             else:
                 raise NotImplementedError(f"unknown guidance mode {self.opt.mode}!")
             print(f"[INFO] loaded guidance!")
@@ -143,7 +153,7 @@ class GUI:
 
         self.renderer.train()
 
-        for _ in range(self.train_steps):
+        for idx in range(self.train_steps):
 
             self.step += 1
             step_ratio = min(1, self.step / self.opt.iters)
@@ -157,13 +167,7 @@ class GUI:
             ori_images = []
             vers, hors, radii = [], [], []
             
-            for _ in range(self.opt.batch_size):
-
-                # render random view
-                ver = np.random.randint(-60, 30)
-                hor = np.random.randint(-180, 180)
-                radius = np.random.uniform() - 0.5 # [-0.5, 0.5]
-                pose = orbit_camera(ver, hor, self.opt.radius + radius)
+            for ver, hor, radius, pose in zip(*self.dataset[idx]):
 
                 vers.append(ver)
                 hors.append(hor)
@@ -208,7 +212,11 @@ class GUI:
             if self.opt.text_dir:
                 guidance_input['vers'] = vers
                 guidance_input['hors'] = hors
-            
+                guidance_input['radii'] = radii
+            if self.opt.mv_mode:
+                guidance_input["n_view"] = self.opt.n_view
+
+
             loss = loss + self.opt.lambda_sd * self.guidance.train_step(**guidance_input)
             
             # geom regularizations

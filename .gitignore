@@ -8,3 +8,6 @@ videos*
 
 *.egg-info
 build/
+
+*.pyc
+*.png
