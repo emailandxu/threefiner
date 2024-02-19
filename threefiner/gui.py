@@ -213,8 +213,8 @@ class GUI:
                 guidance_input['vers'] = vers
                 guidance_input['hors'] = hors
                 guidance_input['radii'] = radii
-            if self.opt.mv_mode:
-                guidance_input["n_view"] = self.opt.n_view
+
+            guidance_input["n_view"] = self.opt.n_view
 
 
             loss = loss + self.opt.lambda_sd * self.guidance.train_step(**guidance_input)

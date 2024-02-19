@@ -147,7 +147,7 @@ class MVDream(nn.Module):
         vers=None,
         hors=None,
         radii=None,
-        n_view=4,
+        n_view=1,
         **kwargs,
     ):
         batch_size = pred_rgb.shape[0]

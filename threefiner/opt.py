@@ -46,13 +46,12 @@ class Options:
     # renderer texture mode
     tex_mode: Literal['hashgrid', 'mlp', 'triplane'] = 'hashgrid'
     
-    mv_mode: bool = False
 
     # training batch size per iter
     
     
-    batch_size: int = 4
-    n_view: int = 4
+    batch_size: int = 1
+    n_view: int = 1
 
     # environmental texture
     env_texture: Optional[str] = None
